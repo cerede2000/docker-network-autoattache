@@ -366,6 +366,10 @@ def extract_desired_networks(
         if not rest:
             continue
 
+        # SPECIAL: detachdefault est un flag global, pas un réseau
+        if rest == "detachdefault":
+            continue
+
         # Internal flag labels: <prefix>.<net>.internal
         if rest.endswith(".internal"):
             net_name = rest[: -len(".internal")]
@@ -413,7 +417,7 @@ def reattach_labelled_containers(
     reason: str,
 ) -> None:
     """Après création/recréation du réseau, rebrancher tous les conteneurs
-    qui ont le label <prefix>.<net_name>: true.
+    qui ont le label <prefix>.<net_name>: true, s'ils ne sont pas déjà attachés.
     """
     prefix: str = cfg["label_prefix"]
     alias_label: str = cfg["alias_label"]
@@ -436,12 +440,22 @@ def reattach_labelled_containers(
         if not isinstance(cid, str):
             continue
 
-        names = c.get("Names") or []
-        if isinstance(names, list) and names:
-            cname = str(names[0]).lstrip("/")
-        else:
-            cname = cid[:12]
+        # Vérifier si le conteneur est déjà attaché à ce réseau
+        inspect = api.inspect_container(cid)
+        if not inspect:
+            continue
+        nets = inspect.get("NetworkSettings", {}).get("Networks", {}) or {}
+        if net_name in nets:
+            if debug:
+                cname = (inspect.get("Name") or cid).lstrip("/")
+                log(
+                    f"[{reason}] Container '{cname}' already attached to '{net_name}', "
+                    "skipping reattach."
+                )
+            continue
 
+        name = inspect.get("Name") or cid
+        cname = str(name).lstrip("/")
         alias = labels.get(alias_label) or cname
 
         try:

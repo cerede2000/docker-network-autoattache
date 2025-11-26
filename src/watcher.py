@@ -38,6 +38,12 @@ managed_networks: Dict[str, Set[str]] = {}
 # networks that were auto-created by the watcher (eligible for prune)
 auto_created_networks: Set[str] = set()
 
+# container_id -> set of networks this container marks as internal (via .internal=true)
+container_internal_networks: Dict[str, Set[str]] = {}
+
+# network_name -> number of containers that currently want this network internal
+internal_refcounts: Dict[str, int] = {}
+
 
 # ---------------------------------------------------------
 # Docker HTTP client
@@ -165,13 +171,20 @@ class DockerAPI:
             return False
         return len(nets) > 0
 
-    def create_network(self, name: str, driver: str | None = None) -> dict:
+    def create_network(
+        self,
+        name: str,
+        driver: str | None = None,
+        internal: bool | None = None,
+    ) -> dict:
         payload: dict = {
             "Name": name,
             "CheckDuplicate": True,
         }
         if driver:
             payload["Driver"] = driver
+        if internal is not None:
+            payload["Internal"] = bool(internal)
         resp = self._post("/networks/create", payload)
         resp.raise_for_status()
         return resp.json()
@@ -339,15 +352,18 @@ def get_network_mode(attrs: dict) -> str | None:
 def extract_desired_networks(
     labels: dict,
     label_prefix: str,
-) -> Tuple[Set[str], Set[str]]:
-    """Return (desired_networks, referenced_networks) for a container.
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Return (desired_networks, referenced_networks, internal_networks).
 
     desired_networks -> networks where label value is truthy
+                        for labels of the form <prefix>.<net>=<value>
     referenced_networks -> networks that have a label with this prefix
-    regardless of the value, so we can later detach when label is removed.
+                           (excluding the .internal ones)
+    internal_networks -> networks with label <prefix>.<net>.internal=true
     """
     desired: Set[str] = set()
     referenced: Set[str] = set()
+    internal: Set[str] = set()
 
     prefix = f"{label_prefix}."
     for key, value in labels.items():
@@ -355,14 +371,27 @@ def extract_desired_networks(
             continue
         if not key.startswith(prefix):
             continue
-        net_name = key[len(prefix) :]
-        if not net_name:
+
+        rest = key[len(prefix) :]
+        if not rest:
             continue
+
+        # Internal flag labels: <prefix>.<net>.internal
+        if rest.endswith(".internal"):
+            net_name = rest[: -len(".internal")]
+            if not net_name:
+                continue
+            if parse_bool(str(value), False):
+                internal.add(net_name)
+            continue
+
+        # Regular attach/detach labels: <prefix>.<net>
+        net_name = rest
         referenced.add(net_name)
         if parse_bool(str(value), False):
             desired.add(net_name)
 
-    return desired, referenced
+    return desired, referenced, internal
 
 
 def maybe_prune_network(
@@ -408,6 +437,294 @@ def maybe_prune_network(
         log(f"[{reason}] Failed to remove unused network '{network}': {e}")
 
 
+def ensure_network(
+    api: DockerAPI,
+    net_name: str,
+    cfg: dict,
+    internal_requested: bool,
+    reason: str = "ensure",
+) -> None:
+    """Ensure that a given network exists, and if internal_requested=True,
+    convert it to internal if needed. Demotion to non-internal is handled
+    separately via maybe_demote_internal_network when refcount drops to zero.
+    """
+    debug: bool = cfg["debug"]
+    default_network_driver: str = cfg["default_network_driver"]
+
+    info = api.inspect_network(net_name)
+
+    # Network doesn't exist -> create it
+    if info is None:
+        try:
+            if debug:
+                log(
+                    f"[{reason}] Network '{net_name}' does not exist; "
+                    f"creating with driver '{default_network_driver}', "
+                    f"internal={internal_requested}"
+                )
+            api.create_network(
+                net_name,
+                driver=default_network_driver,
+                internal=internal_requested,
+            )
+            log(f"[{reason}] Created network '{net_name}'")
+            auto_created_networks.add(net_name)
+        except RequestException as e:
+            log(
+                f"[{reason}] Failed to create network '{net_name}' "
+                f"(internal={internal_requested}): {e}"
+            )
+        return
+
+    # Network exists
+    current_internal = bool(info.get("Internal"))
+
+    # Promotion: non-internal -> internal
+    if internal_requested and not current_internal:
+        containers = (info.get("Containers") or {}).copy()
+        if debug:
+            log(
+                f"[{reason}] Network '{net_name}' exists but is not internal; "
+                f"recreating as internal and reattaching {len(containers)} container(s)."
+            )
+
+        # Detach all containers
+        for cid, cinfo in containers.items():
+            if not isinstance(cid, str):
+                continue
+            try:
+                api.disconnect_network(net_name, cid, force=True)
+                if debug:
+                    cname = cinfo.get("Name") or cid
+                    log(
+                        f"[{reason}] Disconnected container '{cname}' "
+                        f"({cid[:12]}) from '{net_name}' before recreation."
+                    )
+            except RequestException as e:
+                log(
+                    f"[{reason}] Failed to disconnect container {cid} "
+                    f"from '{net_name}' before recreation: {e}"
+                )
+
+        # Remove network
+        try:
+            api.remove_network(net_name)
+            if debug:
+                log(
+                    f"[{reason}] Removed network '{net_name}' "
+                    f"for recreation as internal."
+                )
+        except RequestException as e:
+            log(
+                f"[{reason}] Failed to remove network '{net_name}' "
+                f"for recreation as internal: {e}"
+            )
+            return
+
+        # Recreate network as internal, using same driver if possible
+        driver = info.get("Driver") or default_network_driver
+        try:
+            api.create_network(net_name, driver=driver, internal=True)
+            log(
+                f"[{reason}] Recreated network '{net_name}' as internal "
+                f"(driver={driver})."
+            )
+        except RequestException as e:
+            log(
+                f"[{reason}] Failed to recreate network '{net_name}' "
+                f"as internal: {e}"
+            )
+            return
+
+        # Reattach previously connected containers
+        for cid, cinfo in containers.items():
+            if not isinstance(cid, str):
+                continue
+            try:
+                api.connect_network(net_name, cid, alias=None)
+                if debug:
+                    cname = cinfo.get("Name") or cid
+                    log(
+                        f"[{reason}] Reattached container '{cname}' "
+                        f"({cid[:12]}) to internal network '{net_name}'."
+                    )
+            except RequestException as e:
+                log(
+                    f"[{reason}] Failed to reattach container {cid} "
+                    f"to internal network '{net_name}': {e}"
+                )
+    else:
+        # Either internal_requested is False, or network already matches the desired internal flag.
+        if debug:
+            log(
+                f"[{reason}] Network '{net_name}' already exists "
+                f"(internal={current_internal}); no change requested."
+            )
+
+
+def maybe_demote_internal_network(
+    api: DockerAPI,
+    net_name: str,
+    cfg: dict,
+    reason: str = "internal-demote",
+) -> None:
+    """Demote an internal network back to a normal one when no container
+    requires it to be internal anymore (refcount reached zero).
+    """
+    debug: bool = cfg["debug"]
+    default_network_driver: str = cfg["default_network_driver"]
+
+    info = api.inspect_network(net_name)
+    if info is None:
+        if debug:
+            log(f"[{reason}] Network '{net_name}' not found for demotion.")
+        return
+
+    current_internal = bool(info.get("Internal"))
+    if not current_internal:
+        if debug:
+            log(
+                f"[{reason}] Network '{net_name}' is already non-internal; "
+                "no demotion needed."
+            )
+        return
+
+    containers = (info.get("Containers") or {}).copy()
+    if debug:
+        log(
+            f"[{reason}] Demoting network '{net_name}' from internal to normal; "
+            f"{len(containers)} container(s) will be reattached."
+        )
+
+    # Detach containers
+    for cid, cinfo in containers.items():
+        if not isinstance(cid, str):
+            continue
+        try:
+            api.disconnect_network(net_name, cid, force=True)
+            if debug:
+                cname = cinfo.get("Name") or cid
+                log(
+                    f"[{reason}] Disconnected container '{cname}' "
+                    f"({cid[:12]}) from '{net_name}' before demotion."
+                )
+        except RequestException as e:
+            log(
+                f"[{reason}] Failed to disconnect container {cid} "
+                f"from '{net_name}' before demotion: {e}"
+            )
+
+    # Remove network
+    try:
+        api.remove_network(net_name)
+        if debug:
+            log(
+                f"[{reason}] Removed network '{net_name}' "
+                f"for recreation as non-internal."
+            )
+    except RequestException as e:
+        log(
+            f"[{reason}] Failed to remove network '{net_name}' "
+            f"for recreation as non-internal: {e}"
+        )
+        return
+
+    # Recreate network as non-internal
+    driver = info.get("Driver") or default_network_driver
+    try:
+        api.create_network(net_name, driver=driver, internal=False)
+        log(
+            f"[{reason}] Recreated network '{net_name}' as non-internal "
+            f"(driver={driver})."
+        )
+    except RequestException as e:
+        log(
+            f"[{reason}] Failed to recreate network '{net_name}' "
+            f"as non-internal: {e}"
+        )
+        return
+
+    # Reattach containers
+    for cid, cinfo in containers.items():
+        if not isinstance(cid, str):
+            continue
+        try:
+            api.connect_network(net_name, cid, alias=None)
+            if debug:
+                cname = cinfo.get("Name") or cid
+                log(
+                    f"[{reason}] Reattached container '{cname}' "
+                    f"({cid[:12]}) to non-internal network '{net_name}'."
+                )
+        except RequestException as e:
+            log(
+                f"[{reason}] Failed to reattach container {cid} "
+                f"to non-internal network '{net_name}': {e}"
+            )
+
+
+def update_internal_tracking(
+    container_id: str,
+    new_internal: Set[str],
+    api: DockerAPI,
+    cfg: dict,
+    reason: str,
+) -> None:
+    """Track which networks this container marks as internal, update global
+    refcounts, and trigger demotion when the last container drops .internal.
+    """
+    prev_internal = container_internal_networks.get(container_id, set())
+    if prev_internal == new_internal:
+        return
+
+    debug: bool = cfg["debug"]
+
+    added = new_internal - prev_internal
+    removed = prev_internal - new_internal
+
+    # Increment refcounts for newly internal networks
+    for net_name in added:
+        old = internal_refcounts.get(net_name, 0)
+        internal_refcounts[net_name] = old + 1
+        if debug:
+            log(
+                f"[{reason}] Container {container_id[:12]}: "
+                f"internal +1 for '{net_name}' -> {internal_refcounts[net_name]}"
+            )
+
+    # Decrement refcounts for networks no longer marked internal
+    for net_name in removed:
+        old = internal_refcounts.get(net_name, 0)
+        new_val = max(0, old - 1)
+        if new_val == 0:
+            internal_refcounts.pop(net_name, None)
+            if debug:
+                log(
+                    f"[{reason}] Container {container_id[:12]}: "
+                    f"internal count for '{net_name}' dropped to 0; "
+                    "demoting network."
+                )
+            maybe_demote_internal_network(
+                api,
+                net_name,
+                cfg,
+                reason=f"{reason}:internal-demote",
+            )
+        else:
+            internal_refcounts[net_name] = new_val
+            if debug:
+                log(
+                    f"[{reason}] Container {container_id[:12]}: "
+                    f"internal -1 for '{net_name}' -> {new_val}"
+                )
+
+    # Update per-container tracking
+    if new_internal:
+        container_internal_networks[container_id] = set(new_internal)
+    elif container_id in container_internal_networks:
+        container_internal_networks.pop(container_id, None)
+
+
 def reconcile_container(
     api: DockerAPI,
     container_id: str,
@@ -418,7 +735,6 @@ def reconcile_container(
     alias_label: str = cfg["alias_label"]
     auto_disconnect: bool = cfg["auto_disconnect"]
     debug: bool = cfg["debug"]
-    default_network_driver: str = cfg["default_network_driver"]
 
     try:
         attrs = api.inspect_container(container_id)
@@ -440,9 +756,18 @@ def reconcile_container(
     labels = attrs.get("Config", {}).get("Labels", {}) or {}
     networks = attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
 
-    desired_networks, referenced_networks = extract_desired_networks(
+    desired_networks, referenced_networks, internal_networks = extract_desired_networks(
         labels,
         label_prefix,
+    )
+
+    # Update internal refcounts and maybe demote networks if necessary
+    update_internal_tracking(
+        container_id,
+        internal_networks,
+        api,
+        cfg,
+        reason=reason,
     )
 
     prev_managed = managed_networks.get(container_id, set())
@@ -462,31 +787,26 @@ def reconcile_container(
     if debug:
         log(
             f"[{reason}] {name}: desired={sorted(desired_networks)}, "
+            f"internal={sorted(internal_networks)}, "
             f"managed_attached={sorted(managed_attached)}, "
             f"to_connect={sorted(to_connect)}, "
             f"to_disconnect={sorted(to_disconnect)}",
         )
 
+    # Ensure networks exist and have the correct "internal" property when requested
+    nets_to_ensure = set(desired_networks) | set(internal_networks)
+    for net_name in sorted(nets_to_ensure):
+        internal_requested = net_name in internal_networks
+        ensure_network(
+            api,
+            net_name,
+            cfg,
+            internal_requested=internal_requested,
+            reason=reason,
+        )
+
     # Attach networks whose label value is truthy
     for net_name in sorted(to_connect):
-        try:
-            if not api.network_exists(net_name):
-                if debug:
-                    log(
-                        f"[{reason}] Network '{net_name}' does not exist; "
-                        f"creating with driver '{default_network_driver}'",
-                    )
-                api.create_network(net_name, driver=default_network_driver)
-                log(f"[{reason}] Created network '{net_name}'")
-                # Mark this network as auto-created by the watcher
-                auto_created_networks.add(net_name)
-        except RequestException as e:
-            log(
-                f"[{reason}] Failed to ensure existence of network "
-                f"'{net_name}': {e}",
-            )
-            continue
-
         try:
             if debug:
                 log(
@@ -603,10 +923,38 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                     log(f"[event] Processing {status} for {name or cid}")
 
                 # Special case: destroy
-                # The container no longer exists, so don't call reconcile_container,
-                # but we can attempt pruning for networks we were managing for it.
                 if status == "destroy":
+                    # Remove managed networks for this container (for prune)
                     nets = managed_networks.pop(cid, set())
+
+                    # Update internal tracking on destroy as if labels disappeared
+                    internal_nets = container_internal_networks.pop(cid, set())
+                    for net_name in sorted(internal_nets):
+                        old = internal_refcounts.get(net_name, 0)
+                        new_val = max(0, old - 1)
+                        if new_val == 0:
+                            internal_refcounts.pop(net_name, None)
+                            if debug:
+                                log(
+                                    f"[event:destroy] Container {cid[:12]}: "
+                                    f"internal count for '{net_name}' dropped to 0; "
+                                    "demoting network."
+                                )
+                            maybe_demote_internal_network(
+                                api,
+                                net_name,
+                                cfg,
+                                reason="event:destroy:internal-demote",
+                            )
+                        else:
+                            internal_refcounts[net_name] = new_val
+                            if debug:
+                                log(
+                                    f"[event:destroy] Container {cid[:12]}: "
+                                    f"internal -1 for '{net_name}' -> {new_val}"
+                                )
+
+                    # Prune auto-created networks if needed
                     if cfg.get("prune_unused_networks") and nets:
                         for net_name in sorted(nets):
                             maybe_prune_network(

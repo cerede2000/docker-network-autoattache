@@ -131,10 +131,12 @@ class DockerAPI:
 
     # ---------- Network helpers ----------
 
+    # ---------- Network helpers ----------
+
     def _find_networks_by_name(self, name: str) -> list[dict]:
         """
-        Use /networks?filters={"name":["name"]} which is robust and
-        works well with name-based lookups.
+        Use /networks?filters={"name":["name"]} and then filter on exact match
+        on Name or Id to avoid partial matches (Docker 'name' filter is fuzzy).
         """
         params = {"filters": json.dumps({"name": [name]})}
         resp = self._get("/networks", params=params)
@@ -142,7 +144,14 @@ class DockerAPI:
         data = resp.json()
         if not isinstance(data, list):
             return []
-        return data
+
+        result: list[dict] = []
+        for net in data:
+            n_name = net.get("Name")
+            n_id = net.get("Id") or net.get("ID")
+            if n_name == name or n_id == name:
+                result.append(net)
+        return result
 
     def network_exists(self, network: str) -> bool:
         try:
@@ -150,6 +159,7 @@ class DockerAPI:
         except RequestException:
             return False
         return len(nets) > 0
+
 
     def create_network(self, name: str, driver: str | None = None) -> dict:
         payload: dict = {
@@ -164,8 +174,7 @@ class DockerAPI:
 
     def inspect_network(self, network: str) -> dict | None:
         """
-        Inspect by name; /networks?filters=name returns detailed network objects
-        including Containers.
+        Inspect by exact name/ID using _find_networks_by_name.
         """
         try:
             nets = self._find_networks_by_name(network)
@@ -177,7 +186,7 @@ class DockerAPI:
 
     def remove_network(self, network: str) -> None:
         """
-        Remove by resolving name -> Id, then DELETE /networks/{id}.
+        Remove by resolving exact name/ID -> Id, then DELETE /networks/{id}.
         """
         nets = self._find_networks_by_name(network)
         if not nets:
@@ -187,6 +196,7 @@ class DockerAPI:
             return
         resp = self._delete(f"/networks/{net_id}")
         resp.raise_for_status()
+
 
     # ---------- Events ----------
 

@@ -1,4 +1,3 @@
-````markdown
 # Docker Network Watcher
 
 `docker-network-watcher` is a small sidecar service that automatically attaches and detaches Docker networks to containers based on labels.
@@ -13,7 +12,7 @@ It is designed to:
 labels:
   network-watcher.traefik: "true"
   network-watcher.cloudflare: "false"
-````
+```
 
 ---
 

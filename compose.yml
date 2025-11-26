@@ -14,7 +14,7 @@ services:
     restart: unless-stopped
 
   network-watcher:
-    image: ghcr.io/cerede2000/docker-network-autoattache:latest
+    image: ghcr.io/cerede2000/docker-network-autoattach:latest
     container_name: network-watcher
     environment:
       - DOCKER_HOST=tcp://socket-proxy:2375

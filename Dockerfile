@@ -1,17 +1,22 @@
-FROM python:3.12-slim
+FROM python:3.12-alpine
 
-# Créer un user non-root
-RUN useradd -u 1000 -m watcher
+# Réduire les writes & la verbosité de pip
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Installer les dépendances Python
-RUN pip install --no-cache-dir requests
+# User non-root minimal
+RUN adduser -D -u 1000 watcher
 
 WORKDIR /app
 
+# Copier uniquement le strict nécessaire
 COPY watcher.py /app/watcher.py
 
-USER watcher
+# Installer la seule dépendance dont on a besoin
+RUN pip install --no-cache-dir requests
 
-ENV PYTHONUNBUFFERED=1
+USER watcher
 
 ENTRYPOINT ["python", "-u", "/app/watcher.py"]

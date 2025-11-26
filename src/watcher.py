@@ -924,10 +924,13 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
 
                 # Special case: destroy
                 if status == "destroy":
-                    # Remove managed networks for this container (for prune)
+                    # Réseaux gérés pour ce conteneur (pour le prune éventuel)
                     nets = managed_networks.pop(cid, set())
 
-                    # Update internal tracking on destroy as if labels disappeared
+                    # On met à jour le tracking internal, MAIS SANS démotion.
+                    # La démotion internal->normal est gérée uniquement lors
+                    # des reconcile sur des conteneurs encore existants
+                    # (changement de labels), pas sur destroy.
                     internal_nets = container_internal_networks.pop(cid, set())
                     for net_name in sorted(internal_nets):
                         old = internal_refcounts.get(net_name, 0)
@@ -937,15 +940,11 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                             if debug:
                                 log(
                                     f"[event:destroy] Container {cid[:12]}: "
-                                    f"internal count for '{net_name}' dropped to 0; "
-                                    "demoting network."
+                                    f"internal count for '{net_name}' dropped to 0."
                                 )
-                            maybe_demote_internal_network(
-                                api,
-                                net_name,
-                                cfg,
-                                reason="event:destroy:internal-demote",
-                            )
+                            # Pas de demote ici : si le réseau est encore utilisé,
+                            # il sera ajusté lors d'un futur reconcile. S'il est vide
+                            # et auto-créé, le prune ci-dessous se chargera de le supprimer.
                         else:
                             internal_refcounts[net_name] = new_val
                             if debug:
@@ -954,7 +953,7 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                                     f"internal -1 for '{net_name}' -> {new_val}"
                                 )
 
-                    # Prune auto-created networks if needed
+                    # Prune auto-created networks si plus utilisés
                     if cfg.get("prune_unused_networks") and nets:
                         for net_name in sorted(nets):
                             maybe_prune_network(
@@ -963,11 +962,12 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                                 cfg,
                                 reason="event:destroy:prune",
                             )
-                    # No inspect on a destroyed container.
+
+                    # Pas de reconcile sur un conteneur détruit
                     continue
 
-                # For other statuses (die, stop, start, update, ...),
-                # do a normal reconciliation.
+                # Pour les autres statuts (die, stop, start, update, ...),
+                # reconciliation normale.
                 reconcile_container(api, cid, cfg, reason=f"event:{status}")
         except ReadTimeout:
             if debug:
@@ -979,7 +979,6 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
             log(f"Unexpected error in event loop: {e}")
         log("Re-establishing Docker event stream in 5 seconds...")
         time.sleep(5)
-
 
 def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
     interval = cfg["rescan_seconds"]

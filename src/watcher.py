@@ -35,6 +35,8 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
 # container_id -> set of network names we manage for this container
 managed_networks: Dict[str, Set[str]] = {}
 
+# networks that were auto-created by the watcher (eligible for prune)
+auto_created_networks: Set[str] = set()
 
 # ---------------------------------------------------------
 # Docker HTTP client
@@ -353,7 +355,6 @@ def extract_desired_networks(
 
     return desired, referenced
 
-
 def maybe_prune_network(
     api: DockerAPI,
     network: str,
@@ -364,6 +365,15 @@ def maybe_prune_network(
         return
 
     debug: bool = cfg["debug"]
+
+    # Only prune networks that were auto-created by the watcher
+    if network not in auto_created_networks:
+        if debug:
+            log(
+                f"[{reason}] Not pruning network '{network}' "
+                f"(not auto-created by watcher)."
+            )
+        return
 
     info = api.inspect_network(network)
     if info is None:
@@ -383,9 +393,9 @@ def maybe_prune_network(
     try:
         api.remove_network(network)
         log(f"[{reason}] Removed unused network '{network}'")
+        auto_created_networks.discard(network)
     except RequestException as e:
         log(f"[{reason}] Failed to remove unused network '{network}': {e}")
-
 
 def reconcile_container(
     api: DockerAPI,
@@ -457,6 +467,8 @@ def reconcile_container(
                     )
                 api.create_network(net_name, driver=default_network_driver)
                 log(f"[{reason}] Created network '{net_name}'")
+                # Mark this network as auto-created by the watcher
+                auto_created_networks.add(net_name)
         except RequestException as e:
             log(
                 f"[{reason}] Failed to ensure existence of network "

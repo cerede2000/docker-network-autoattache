@@ -4,7 +4,7 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - watcher.py      # ✅ ne déclenche que si ce fichier change
+      - src/watcher.py      # ✅ ne déclenche que si ce fichier change
   workflow_dispatch: {} # tu peux toujours le lancer à la main si besoin
 
 env:

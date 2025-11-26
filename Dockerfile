@@ -1,5 +1,8 @@
 FROM python:3.12-alpine
 
+# Build-time arg, avec valeur par défaut pour les builds locaux
+ARG GIT_COMMIT=dev
+
 # Réduire les writes & la verbosité de pip
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

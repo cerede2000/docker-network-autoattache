@@ -275,6 +275,8 @@ def load_config() -> dict:
         False,
     )
 
+    self_id = os.getenv("HOSTNAME", "").strip()
+
     log("Loaded network-watcher configuration:")
     log(f" Label prefix: {label_prefix}")
     log(f" Alias label: {alias_label}")
@@ -285,6 +287,7 @@ def load_config() -> dict:
     log(f" Default network driver: {default_network_driver}")
     log(f" Prune unused networks: {prune_unused_networks}")
     log(f" Detach other networks (global): {detach_other}")
+    log(f" Self container id (HOSTNAME): {self_id or '<unknown>'}")
 
     return {
         "label_prefix": label_prefix,
@@ -297,6 +300,7 @@ def load_config() -> dict:
         "default_network_driver": default_network_driver,
         "prune_unused_networks": prune_unused_networks,
         "detach_other": detach_other,
+        "self_container_id": self_id,
     }
 
 
@@ -658,7 +662,7 @@ def reconcile_container(
     alias_label: str = cfg["alias_label"]
     auto_disconnect: bool = cfg["auto_disconnect"]
     debug: bool = cfg["debug"]
-    detach_other: bool = cfg.get("detach_other", False)
+    detach_other_global: bool = cfg.get("detach_other", False)
 
     try:
         attrs = api.inspect_container(container_id)
@@ -685,18 +689,51 @@ def reconcile_container(
     labels = attrs.get("Config", {}).get("Labels", {}) or {}
     networks = attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
 
+    # Détection self-container
+    self_id = cfg.get("self_container_id") or ""
+    is_self = False
+    if isinstance(self_id, str) and self_id:
+        if container_id.startswith(self_id) or self_id.startswith(container_id):
+            is_self = True
+        elif get_container_name(attrs) == self_id:
+            is_self = True
+
+    # Détecter présence d'au moins un label network-watcher.* (quel qu'il soit)
+    has_prefix_label = any(
+        isinstance(k, str) and k.startswith(f"{label_prefix}.")
+        for k in labels.keys()
+    )
+
+    prev_managed = managed_networks.get(container_id, set())
+
+    # Si aucun label network-watcher.* ET jamais géré auparavant -> ne rien faire
+    if not has_prefix_label and not prev_managed:
+        if debug:
+            log(
+                f"[{reason}] {name}: no {label_prefix}.* labels and not previously "
+                "managed; skipping."
+            )
+        return
+
     desired_networks, referenced_networks, internal_networks = extract_desired_networks(
         labels,
         label_prefix,
     )
 
-    detach_default = parse_bool(labels.get(f"{label_prefix}.detachdefault"), False)
+    raw_detach_default = parse_bool(labels.get(f"{label_prefix}.detachdefault"), False)
+
+    if is_self:
+        # On ne touche pas aux réseaux par défaut du watcher lui-même,
+        # ni en mode detachdefault, ni en mode detach_other.
+        detach_default = False
+        detach_other = False
+    else:
+        detach_default = raw_detach_default
+        detach_other = detach_other_global
 
     prev_managed = managed_networks.get(container_id, set())
-    # Union pour garder mémoire des réseaux déjà gérés (cas label supprimé)
     managed = set(prev_managed) | set(referenced_networks)
 
-    # Réseaux actuellement attachés que l'on considère "gérés"
     attached_names = set(networks.keys())
     managed_attached = attached_names & managed
 
@@ -712,8 +749,10 @@ def reconcile_container(
             f"managed_attached={sorted(managed_attached)}, "
             f"to_connect={sorted(to_connect)}, "
             f"to_disconnect={sorted(to_disconnect)}, "
-            f"detach_default={detach_default}, "
-            f"detach_other(global)={detach_other}",
+            f"detach_default={detach_default} "
+            f"(raw={raw_detach_default}, is_self={is_self}), "
+            f"detach_other_effective={detach_other} "
+            f"(global={detach_other_global})",
         )
 
     # 1) S'assurer de l'existence + internal flag pour les réseaux concernés
@@ -824,8 +863,6 @@ def reconcile_container(
                 if net_name in desired_networks:
                     continue  # on garde les réseaux demandés par labels
 
-                # On ne fait aucune distinction internal / non-internal ici :
-                # le mode DETACH_OTHER est strict : labels only.
                 try:
                     if debug:
                         log(

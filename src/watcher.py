@@ -15,6 +15,7 @@ from requests.exceptions import RequestException, ReadTimeout
 # Logging helpers
 # ---------------------------------------------------------
 
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -177,7 +178,8 @@ class DockerAPI:
 
     def inspect_network(self, network: str) -> dict | None:
         """
-        Inspect by exact name/ID using _find_networks_by_name.
+        Inspect by exact name/ID: resolve via _find_networks_by_name, then
+        call /networks/{id} to get full details including Containers.
         """
         try:
             nets = self._find_networks_by_name(network)
@@ -185,7 +187,15 @@ class DockerAPI:
             return None
         if not nets:
             return None
-        return nets[0]
+        net_id = nets[0].get("Id") or nets[0].get("ID")
+        if not isinstance(net_id, str):
+            return None
+        try:
+            resp = self._get(f"/networks/{net_id}")
+            resp.raise_for_status()
+        except RequestException:
+            return None
+        return resp.json()
 
     def remove_network(self, network: str) -> None:
         """

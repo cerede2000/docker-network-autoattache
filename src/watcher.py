@@ -545,7 +545,6 @@ def initial_attach_all(api: DockerAPI, cfg: dict) -> None:
 # Event loop + periodic rescan
 # ---------------------------------------------------------
 
-
 def event_loop(api: DockerAPI, cfg: dict) -> None:
     relevant_statuses = {
         "create",
@@ -574,8 +573,16 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                     continue
 
                 if status in {"destroy", "die"}:
-                    # Best-effort cleanup of our local cache
-                    managed_networks.pop(cid, None)
+                    # Récupère les réseaux que nous gérions pour ce conteneur
+                    nets = managed_networks.pop(cid, set())
+                    if cfg.get("prune_unused_networks") and nets:
+                        for net_name in sorted(nets):
+                            maybe_prune_network(
+                                api,
+                                net_name,
+                                cfg,
+                                reason=f"event:{status}:prune",
+                            )
 
                 if debug:
                     name = event.get("Actor", {}).get("Attributes", {}).get("name")
@@ -583,7 +590,6 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
 
                 reconcile_container(api, cid, cfg, reason=f"event:{status}")
         except ReadTimeout:
-            # Normal when idle; just re-open the stream.
             if debug:
                 log("Event stream read timeout; reopening...")
             continue
@@ -593,7 +599,6 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
             log(f"Unexpected error in event loop: {e}")
         log("Re-establishing Docker event stream in 5 seconds...")
         time.sleep(5)
-
 
 def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
     interval = cfg["rescan_seconds"]

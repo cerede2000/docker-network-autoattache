@@ -1,0 +1,32 @@
+services:
+  socket-proxy:
+    image: lscr.io/linuxserver/socket-proxy:latest
+    container_name: socket-proxy
+    environment:
+      - CONTAINERS=1     # /containers/*
+      - NETWORKS=1       # /networks/*
+      - EVENTS=1         # /events
+      - VERSION=1        # /version
+      - POST=1           # autoriser les POST (connect/disconnect)
+      - TZ=Europe/Paris
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  network-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: network-watcher
+    environment:
+      - DOCKER_HOST=tcp://socket-proxy:2375
+      - NETWORK_WATCHER_PREFIX=network-watcher
+      # Options :
+      - INITIAL_ATTACH=true          # attache au démarrage du watcher
+      - INITIAL_RUNNING_ONLY=false   # true = uniquement conteneurs "running"
+      - AUTO_DISCONNECT=true         # détache si false ou label supprimé
+      - RESCAN_SECONDS=30            # 0 pour désactiver le rescan périodique
+      - DEBUG=false                  # true pour spammer les logs
+    depends_on:
+      - socket-proxy
+    restart: unless-stopped

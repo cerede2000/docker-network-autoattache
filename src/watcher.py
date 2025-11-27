@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Set, Tuple
 
 import requests
@@ -112,7 +112,6 @@ class DockerAPI:
             resp.raise_for_status()
             return resp.json()
         except HTTPError as e:
-            # 404 => conteneur déjà supprimé / disparu
             if e.response is not None and e.response.status_code == 404:
                 return None
             raise
@@ -142,10 +141,6 @@ class DockerAPI:
     # ---------- Network helpers ----------
 
     def _find_networks_by_name(self, name: str) -> list[dict]:
-        """
-        /networks?filters={"name":["name"]} est fuzzy, donc on filtre ensuite
-        sur Name/Id exacts.
-        """
         params = {"filters": json.dumps({"name": [name]})}
         resp = self._get("/networks", params=params)
         resp.raise_for_status()
@@ -180,10 +175,6 @@ class DockerAPI:
         return resp.json()
 
     def inspect_network(self, network: str) -> dict | None:
-        """
-        Inspect par nom/ID exact : on résout via _find_networks_by_name,
-        puis /networks/{id} pour avoir Containers.
-        """
         try:
             nets = self._find_networks_by_name(network)
         except RequestException:
@@ -201,9 +192,6 @@ class DockerAPI:
         return resp.json()
 
     def remove_network(self, network: str) -> None:
-        """
-        Suppression en résolvant nom/ID -> Id, puis DELETE /networks/{id}.
-        """
         nets = self._find_networks_by_name(network)
         if not nets:
             return
@@ -214,9 +202,6 @@ class DockerAPI:
         resp.raise_for_status()
 
     def list_networks(self, filters: dict | None = None) -> list[dict]:
-        """
-        Liste tous les réseaux Docker (optionnellement filtrés).
-        """
         params: dict = {}
         if filters:
             params["filters"] = json.dumps(filters)
@@ -289,6 +274,22 @@ def load_config() -> dict:
         False,
     )
 
+    prune_orphan_include_compose = parse_bool(
+        os.getenv("NETWORK_WATCHER_PRUNE_ORPHAN_INCLUDE_COMPOSE", "false"),
+        False,
+    )
+
+    prune_orphan_min_age_str = os.getenv(
+        "NETWORK_WATCHER_PRUNE_ORPHAN_MIN_AGE",
+        "600",
+    )
+    try:
+        prune_orphan_min_age = int(prune_orphan_min_age_str)
+        if prune_orphan_min_age < 0:
+            prune_orphan_min_age = 0
+    except ValueError:
+        prune_orphan_min_age = 600
+
     detach_other = parse_bool(
         os.getenv("NETWORK_WATCHER_DETACH_OTHER", "false"),
         False,
@@ -306,6 +307,8 @@ def load_config() -> dict:
     log(f" Default network driver: {default_network_driver}")
     log(f" Prune unused networks (managed): {prune_unused_networks}")
     log(f" Prune orphan networks (global): {prune_orphan_networks}")
+    log(f"   Include compose/stack networks: {prune_orphan_include_compose}")
+    log(f"   Min orphan age seconds: {prune_orphan_min_age} (0 = no age check)")
     log(f" Detach other networks (global): {detach_other}")
     log(f" Self container id (HOSTNAME): {self_id or '<unknown>'}")
 
@@ -320,6 +323,8 @@ def load_config() -> dict:
         "default_network_driver": default_network_driver,
         "prune_unused_networks": prune_unused_networks,
         "prune_orphan_networks": prune_orphan_networks,
+        "prune_orphan_include_compose": prune_orphan_include_compose,
+        "prune_orphan_min_age": prune_orphan_min_age,
         "detach_other": detach_other,
         "self_container_id": self_id,
     }
@@ -398,11 +403,9 @@ def extract_desired_networks(
         if not rest:
             continue
 
-        # detachdefault est un flag global, pas un réseau
         if rest == "detachdefault":
             continue
 
-        # Internal flag labels: <prefix>.<net>.internal
         if rest.endswith(".internal"):
             net_name = rest[: -len(".internal")]
             if not net_name:
@@ -411,7 +414,6 @@ def extract_desired_networks(
                 internal.add(net_name)
             continue
 
-        # Regular attach/detach labels: <prefix>.<net>
         net_name = rest
         referenced.add(net_name)
         if parse_bool(str(value), False):
@@ -425,7 +427,6 @@ def network_internal_desired(
     net_name: str,
     cfg: dict,
 ) -> bool:
-    """True s'il existe au moins un conteneur avec <prefix>.<net>.internal=true."""
     prefix: str = cfg["label_prefix"]
     key = f"{prefix}.{net_name}.internal"
 
@@ -448,9 +449,6 @@ def reattach_labelled_containers(
     net_name: str,
     reason: str,
 ) -> None:
-    """Après création/recréation du réseau, rebrancher tous les conteneurs
-    qui ont le label <prefix>.<net_name>: true, s'ils ne sont pas déjà attachés.
-    """
     prefix: str = cfg["label_prefix"]
     alias_label: str = cfg["alias_label"]
     debug: bool = cfg["debug"]
@@ -506,11 +504,6 @@ def ensure_network_state(
     cfg: dict,
     reason: str = "ensure",
 ) -> None:
-    """S'assure que le réseau existe et a le bon flag Internal,
-    en fonction des labels .internal de tous les conteneurs.
-
-    N'importe quel réseau Docker peut être converti internal <-> non internal.
-    """
     debug: bool = cfg["debug"]
     default_network_driver: str = cfg["default_network_driver"]
 
@@ -518,7 +511,6 @@ def ensure_network_state(
 
     info = api.inspect_network(net_name)
 
-    # Le réseau n'existe pas -> on le crée avec le bon flag
     if info is None:
         try:
             if debug:
@@ -533,7 +525,6 @@ def ensure_network_state(
                 internal=internal_needed,
             )
             log(f"[{reason}] Created network '{net_name}' (internal={internal_needed})")
-            # Après création, rebrancher tous les conteneurs qui ont le label pour ce réseau
             reattach_labelled_containers(api, cfg, net_name, reason)
         except RequestException as e:
             log(
@@ -542,7 +533,6 @@ def ensure_network_state(
             )
         return
 
-    # Réseau existant
     current_internal = bool(info.get("Internal"))
     driver = info.get("Driver") or default_network_driver
 
@@ -554,7 +544,6 @@ def ensure_network_state(
             )
         return
 
-    # Conversion internal <-> non internal
     containers = (info.get("Containers") or {}).copy()
     if debug:
         log(
@@ -563,7 +552,6 @@ def ensure_network_state(
             f"{len(containers)} container(s) will be recycled."
         )
 
-    # Détacher tous les conteneurs
     for cid, cinfo in containers.items():
         if not isinstance(cid, str):
             continue
@@ -581,7 +569,6 @@ def ensure_network_state(
                 f"from '{net_name}' before recreation: {e}"
             )
 
-    # Suppression du réseau
     try:
         api.remove_network(net_name)
         if debug:
@@ -596,7 +583,6 @@ def ensure_network_state(
         )
         return
 
-    # Recréation avec le nouveau flag
     try:
         api.create_network(net_name, driver=driver, internal=internal_needed)
         log(
@@ -610,7 +596,6 @@ def ensure_network_state(
         )
         return
 
-    # Rattacher les conteneurs qui étaient déjà sur ce réseau avant recréation
     for cid, cinfo in containers.items():
         if not isinstance(cid, str):
             continue
@@ -628,7 +613,6 @@ def ensure_network_state(
                 f"to network '{net_name}': {e}"
             )
 
-    # Et rebrancher tous les conteneurs qui ont le label pour ce réseau
     reattach_labelled_containers(api, cfg, net_name, reason)
 
 
@@ -638,7 +622,6 @@ def maybe_prune_network(
     cfg: dict,
     reason: str = "prune",
 ) -> None:
-    """Prune un réseau s'il n'a plus aucun conteneur attaché (réseaux gérés)."""
     if not cfg.get("prune_unused_networks"):
         return
 
@@ -668,19 +651,13 @@ def maybe_prune_network(
 
 
 def is_system_network(net: dict) -> bool:
-    """
-    Retourne True si le réseau est un réseau système Docker
-    qu'on ne doit jamais supprimer automatiquement.
-    """
     name = net.get("Name") or ""
     if not isinstance(name, str):
         name = str(name)
 
-    # Réseaux système classiques
     if name in {"bridge", "host", "none", "docker_gwbridge"}:
         return True
 
-    # Réseaux ingress swarm
     if net.get("Ingress"):
         return True
     if name == "ingress":
@@ -689,51 +666,27 @@ def is_system_network(net: dict) -> bool:
     return False
 
 
-def compute_labelled_networks(api: DockerAPI, cfg: dict) -> Set[str]:
-    """
-    Renvoie l'ensemble des noms de réseaux référencés par des labels
-    network-watcher.* sur les conteneurs (desired + referenced + internal).
-    Ces réseaux ne doivent pas être pris pour des orphelins.
-    """
-    label_prefix: str = cfg["label_prefix"]
-    labelled: Set[str] = set()
-
-    try:
-        containers = api.list_containers(all_containers=True)
-    except RequestException as e:
-        log(f"[prune-orphans] Error listing containers to compute labelled networks: {e}")
-        return labelled
-
-    for c in containers:
-        labels = c.get("Labels") or {}
-        d, r, internal = extract_desired_networks(labels, label_prefix)
-        labelled |= d
-        labelled |= r
-        labelled |= internal
-
-    return labelled
-
-
 def prune_orphan_networks(
     api: DockerAPI,
     cfg: dict,
     reason: str = "prune-orphans",
 ) -> None:
-    """
-    Prune globalement les réseaux orphelins :
-    - aucun conteneur connecté
-    - pas un réseau système Docker
-    - pas un réseau docker-compose / stack
-    - pas un réseau référencé par des labels network-watcher.*
-    Activé via NETWORK_WATCHER_PRUNE_ORPHAN_NETWORKS.
+    """Global orphan network prune.
+
+    Conditions pour supprimer un réseau :
+      - NETWORK_WATCHER_PRUNE_ORPHAN_NETWORKS = true
+      - pas un réseau système Docker (bridge/host/none/docker_gwbridge/ingress…)
+      - si NETWORK_WATCHER_PRUNE_ORPHAN_INCLUDE_COMPOSE = false :
+          ne pas toucher aux réseaux docker-compose / stack
+      - aucun conteneur attaché
+      - âge >= NETWORK_WATCHER_PRUNE_ORPHAN_MIN_AGE (si > 0)
     """
     if not cfg.get("prune_orphan_networks"):
         return
 
     debug: bool = cfg["debug"]
-
-    # Réseaux référencés par des labels network-watcher.* -> on ne les considère pas orphelins
-    labelled_networks = compute_labelled_networks(api, cfg)
+    include_compose: bool = cfg.get("prune_orphan_include_compose", False)
+    min_age: int = cfg.get("prune_orphan_min_age", 0)
 
     try:
         networks = api.list_networks()
@@ -741,43 +694,69 @@ def prune_orphan_networks(
         log(f"[{reason}] Error listing networks: {e}")
         return
 
+    now = datetime.now(timezone.utc)
+
     for net in networks:
         if not isinstance(net, dict):
             continue
+
         name = net.get("Name")
         if not isinstance(name, str) or not name:
             continue
 
-        # Skip system networks
         if is_system_network(net):
             if debug:
                 log(f"[{reason}] Skipping system network '{name}'")
             continue
 
-        labels = net.get("Labels") or {}
+        # Inspect complet pour avoir Containers + Created + Labels fiables
+        info = api.inspect_network(name)
+        if not info:
+            continue
 
-        # Skip docker-compose / stack networks to avoid breaking stacks
-        if any(
+        labels = info.get("Labels") or net.get("Labels") or {}
+
+        # Réseaux docker-compose / stack : optionnels
+        is_compose = any(
             isinstance(k, str)
             and (k.startswith("com.docker.compose.") or k.startswith("com.docker.stack."))
             for k in labels.keys()
-        ):
+        )
+        if is_compose and not include_compose:
             if debug:
                 log(f"[{reason}] Skipping compose/stack network '{name}'")
             continue
 
-        # Skip networks referenced by network-watcher labels
-        if name in labelled_networks:
-            if debug:
-                log(
-                    f"[{reason}] Skipping network '{name}' "
-                    "because it is referenced by network-watcher labels."
-                )
+        containers = info.get("Containers") or {}
+        if containers:
+            # Pas orphelin
             continue
 
-        containers = net.get("Containers") or {}
-        if containers:
-            continue
+        # Filtre sur l'âge (pour ne pas flinguer un réseau fraîchement créé
+        # pendant un docker compose up ou stack deploy)
+        if min_age > 0:
+            created_str = info.get("Created") or net.get("Created")
+            if isinstance(created_str, str) and created_str:
+                try:
+                    s = created_str.rstrip("Z")
+                    created_dt = datetime.fromisoformat(s)
+                    if created_dt.tzinfo is None:
+                        created_dt = created_dt.replace(tzinfo=timezone.utc)
+                    age = (now - created_dt).total_seconds()
+                    if age < min_age:
+                        if debug:
+                            log(
+                                f"[{reason}] Skipping young orphan network '{name}' "
+                                f"(age={int(age)}s < {min_age}s)"
+                            )
+                        continue
+                except Exception:  # noqa: BLE001
+                    # Si parse foire, on ignore juste le critère d'âge
+                    if debug:
+                        log(
+                            f"[{reason}] Failed to parse Created for network '{name}', "
+                            "ignoring age filter."
+                        )
 
         try:
             api.remove_network(name)
@@ -804,7 +783,6 @@ def reconcile_container(
     debug: bool = cfg["debug"]
     detach_other_global: bool = cfg.get("detach_other", False)
 
-    # 1) Inspect initial
     try:
         attrs = api.inspect_container(container_id)
         if attrs is None:
@@ -829,7 +807,6 @@ def reconcile_container(
     labels = attrs.get("Config", {}).get("Labels", {}) or {}
     networks = attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
 
-    # --- Détection self-container ---
     self_id = cfg.get("self_container_id") or ""
     is_self = False
     if isinstance(self_id, str) and self_id:
@@ -838,7 +815,6 @@ def reconcile_container(
         elif get_container_name(attrs) == self_id:
             is_self = True
 
-    # Présence d'au moins un label network-watcher.*
     has_prefix_label = any(
         isinstance(k, str) and k.startswith(f"{label_prefix}.")
         for k in labels.keys()
@@ -846,7 +822,6 @@ def reconcile_container(
 
     prev_managed = managed_networks.get(container_id, set())
 
-    # Si aucun label network-watcher.* ET jamais géré auparavant -> on ne touche pas
     if not has_prefix_label and not prev_managed:
         if debug:
             log(
@@ -855,38 +830,30 @@ def reconcile_container(
             )
         return
 
-    # 2) Extraction des réseaux désirés / référencés / internal
     desired_networks, referenced_networks, internal_networks = extract_desired_networks(
         labels,
         label_prefix,
     )
 
-    # 3) Calcul detach_default / detach_other (logique globale + override label)
     detach_label_key = f"{label_prefix}.detachdefault"
     detach_label_present = detach_label_key in labels
     detach_label_raw = labels.get(detach_label_key)
 
     if is_self:
-        # Le watcher lui-même : on ne joue pas avec ses réseaux
         detach_default = False
         detach_other = False
     else:
-        # detach_default: n'agit que si le label est explicitement "true"
         if detach_label_present and parse_bool(str(detach_label_raw), False):
             detach_default = True
         else:
             detach_default = False
 
-        # detach_other: global + override via label
         if detach_other_global:
-            # Global ON -> par défaut labels-only,
-            # sauf si detachdefault:false est explicitement posé
             if detach_label_present and not parse_bool(str(detach_label_raw), True):
                 detach_other = False
             else:
                 detach_other = True
         else:
-            # Global OFF -> detach_other peut être activé par detachdefault:true
             if detach_label_present and parse_bool(str(detach_label_raw), False):
                 detach_other = True
             else:
@@ -895,7 +862,6 @@ def reconcile_container(
     prev_managed = managed_networks.get(container_id, set())
     managed = set(prev_managed) | set(referenced_networks)
 
-    # 4) S'assurer des réseaux (existence + internal) AVANT de calculer to_connect
     nets_to_ensure = set(desired_networks) | set(internal_networks)
     for net_name in sorted(nets_to_ensure):
         ensure_network_state(
@@ -905,7 +871,6 @@ def reconcile_container(
             reason=reason,
         )
 
-    # 5) Re-inspect après ensure_network_state pour avoir l'état réseaux à jour
     try:
         attrs = api.inspect_container(container_id)
         if attrs is None:
@@ -946,7 +911,6 @@ def reconcile_container(
             f"(global={detach_other_global})",
         )
 
-    # 6) Attach des réseaux desired
     for net_name in sorted(to_connect):
         try:
             if debug:
@@ -962,7 +926,6 @@ def reconcile_container(
                 f"[{reason}] Failed to connect '{name}' to '{net_name}': {e}",
             )
 
-    # 7) Detach des réseaux gérés plus désirés
     if auto_disconnect:
         for net_name in sorted(to_disconnect):
             try:
@@ -991,7 +954,6 @@ def reconcile_container(
             f"would disconnect from: {sorted(to_disconnect)}",
         )
 
-    # 8) detach_default: détache les réseaux "par défaut" non gérés (non internal)
     if detach_default:
         current_attached = (attached_names - to_disconnect) | to_connect
         for net_name in sorted(current_attached):
@@ -1021,7 +983,6 @@ def reconcile_container(
                     f"from default/non-managed network '{net_name}': {e}",
                 )
 
-    # 9) Mode labels-only strict (detach_other)
     if detach_other:
         try:
             fresh = api.inspect_container(container_id)
@@ -1053,10 +1014,9 @@ def reconcile_container(
                 except RequestException as e:
                     log(
                         f"[{reason}] detach_other: failed to disconnect '{fresh_name}' "
-                        f"from '{net_name}': {e}"
+                            f"from '{net_name}': {e}"
                     )
 
-    # 10) Mise à jour du cache managed_networks
     if managed:
         managed_networks[container_id] = managed
     elif container_id in managed_networks:
@@ -1093,7 +1053,6 @@ def initial_attach_all(api: DockerAPI, cfg: dict) -> None:
             continue
         reconcile_container(api, cid, cfg, reason="initial")
 
-    # Prune global des réseaux orphelins après l'initial attach (si activé)
     prune_orphan_networks(api, cfg, reason="initial:orphans")
 
     log("Initial attach complete.")
@@ -1183,7 +1142,6 @@ def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
                 continue
             reconcile_container(api, cid, cfg, reason="rescan")
 
-        # Prune global des réseaux orphelins à chaque rescan (si activé)
         prune_orphan_networks(api, cfg, reason="rescan:orphans")
 
 
@@ -1215,7 +1173,6 @@ def main() -> None:
             args=(api, cfg),
             daemon=True,
         )
-        
         t.start()
 
     event_loop(api, cfg)

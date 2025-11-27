@@ -20,6 +20,8 @@ jobs:
     env:
       REGISTRY: ghcr.io
       IMAGE_NAME: ${{ github.repository }}
+      # Tu peux changer la base quand tu veux repartir sur une nouvelle série
+      BASE_VERSION: "0.1"
 
     steps:
       - name: Checkout repository
@@ -29,6 +31,26 @@ jobs:
         run: |
           echo "IMAGE_NAME_LOWER=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
           echo "PKG_NAME=$(basename '${{ env.IMAGE_NAME }}')" >> $GITHUB_ENV
+
+      - name: Compute image version and tags
+        id: meta
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          # Version auto-incrémentale: BASE_VERSION.run_number
+          VERSION="${BASE_VERSION}.${GITHUB_RUN_NUMBER}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:${VERSION},"
+          TAGS+="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:sha-${SHORT_SHA},"
+          TAGS+="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:latest"
+
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+          echo "Computed version: ${VERSION}"
+          echo "Image tags: ${TAGS}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -44,17 +66,12 @@ jobs:
           push: true
           build-args: |
             GIT_COMMIT=${{ github.sha }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:${{ github.sha }}
+            WATCHER_VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
 
       - name: Prune old container versions (keep last 3)
         uses: actions/delete-package-versions@v5
         with:
-          # Pour les images GHCR de type ghcr.io/OWNER/REPO,
-          # le "package name" côté Packages = REPO
           package-name: ${{ env.PKG_NAME }}
           package-type: container
-          # On garde les 3 dernières versions, les plus anciennes sont supprimées
           min-versions-to-keep: 3
-          # token: ${{ secrets.PACKAGES_TOKEN }} # optionnel si ton repo n'a pas l'accès admin sur le package

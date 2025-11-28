@@ -6,10 +6,17 @@ import threading
 import time
 from datetime import datetime
 from typing import Dict, Set, Tuple, Optional, List, Any
+from urllib.parse import quote
 
 import requests
 from requests import Response
 from requests.exceptions import RequestException, ReadTimeout
+
+# Optional: unix socket support
+try:
+    import requests_unixsocket  # type: ignore
+except ImportError:
+    requests_unixsocket = None  # type: ignore
 
 # ---------------------------------------------------------
 # Logging helpers
@@ -68,14 +75,37 @@ managed_networks: Dict[str, Set[str]] = {}
 
 class DockerAPI:
     def __init__(self, base_url: str, timeout: int = 5) -> None:
-        self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.base_url, self.session = self._init_session(base_url)
         self.api_prefix = self._detect_api_prefix()
+
+    def _init_session(self, base_url: str) -> tuple[str, requests.Session]:
+        """
+        Initialise la session HTTP en fonction du schéma :
+        - unix://path → http+unix://%2Fpath avec requests_unixsocket
+        - http/https/... → requests.Session classique
+        """
+        base_url = base_url.rstrip("/")
+
+        if base_url.startswith("unix://"):
+            if requests_unixsocket is None:
+                raise RuntimeError(
+                    "DOCKER_HOST uses unix:// but 'requests-unixsocket' is not installed "
+                    "in the container image."
+                )
+            sock_path = base_url[len("unix://") :]
+            encoded = quote(sock_path, safe="")
+            session = requests_unixsocket.Session()  # type: ignore[arg-type]
+            # requests-unixsocket utilise le schéma http+unix://
+            return f"http+unix://{encoded}", session
+        else:
+            session = requests.Session()
+            return base_url, session
 
     def _detect_api_prefix(self) -> str:
         url = f"{self.base_url}/version"
         try:
-            resp = requests.get(url, timeout=self.timeout)
+            resp = self.session.get(url, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
             api_version = data.get("ApiVersion") or data.get("APIVersion") or "1.52"
@@ -102,7 +132,7 @@ class DockerAPI:
         timeout: Optional[int] = None,
     ) -> Response:
         url = self._url(path)
-        return requests.get(
+        return self.session.get(
             url,
             params=params,
             timeout=timeout or self.timeout,
@@ -111,7 +141,7 @@ class DockerAPI:
 
     def _post(self, path: str, payload: dict, timeout: Optional[int] = None) -> Response:
         url = self._url(path)
-        return requests.post(
+        return self.session.post(
             url,
             json=payload,
             timeout=timeout or self.timeout,
@@ -203,7 +233,7 @@ class DockerAPI:
 
     def remove_network(self, network: str) -> None:
         url = self._url(f"/networks/{network}")
-        resp = requests.delete(url, timeout=self.timeout)
+        resp = self.session.delete(url, timeout=self.timeout)
         resp.raise_for_status()
 
 
@@ -298,23 +328,30 @@ def load_config() -> dict:
 
 
 def get_base_url_from_env() -> str:
-    host = os.getenv("DOCKER_HOST", "http://socket-proxy:2375").strip()
+    """
+    Choix de la cible Docker, dans l’ordre :
+      1. DOCKER_HOST si présent.
+      2. Sinon, si /var/run/docker.sock existe → unix:///var/run/docker.sock
+      3. Sinon → http://socket-proxy:2375 (comportement historique).
+    """
+    host = os.getenv("DOCKER_HOST", "").strip()
 
-    # Normalize some common values
-    if host.startswith("unix://"):
-        log(
-            "ERROR: unix:// DOCKER_HOST is not supported by this watcher "
-            "(use a TCP SocketProxy instead)."
-        )
-        sys.exit(1)
+    if host:
+        # DOCKER_HOST explicite
+        if host.startswith("tcp://"):
+            host = "http://" + host[len("tcp://") :]
+        # unix://... est géré plus tard dans DockerAPI._init_session
+        if host.startswith("http://") or host.startswith("https://") or host.startswith("unix://"):
+            return host.rstrip("/")
+        # host:port ou hostname simple
+        return f"http://{host.rstrip('/')}"
+    else:
+        # Pas de DOCKER_HOST → si socket monté, on l'utilise
+        if os.path.exists("/var/run/docker.sock"):
+            return "unix:///var/run/docker.sock"
 
-    if host.startswith("tcp://"):
-        host = "http://" + host[len("tcp://") :]
-
-    if not host.startswith("http://") and not host.startswith("https://"):
-        host = "http://" + host
-
-    return host.rstrip("/")
+        # Fallback historique: socket-proxy
+        return "http://socket-proxy:2375"
 
 
 def get_container_name(attrs: dict) -> str:
@@ -750,7 +787,7 @@ def reconcile_container(
     to_connect = desired_networks - managed_attached
     to_disconnect = managed_attached - desired_networks
 
-    # --- NEW: multi-alias support ---
+    # multi-alias support
     raw_alias = labels.get(alias_label)
     aliases = parse_aliases(raw_alias, fallback=name)
 
@@ -982,7 +1019,7 @@ def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
 
 def main() -> None:
     base_url = get_base_url_from_env()
-    log(f"Connecting to Docker Engine via HTTP at: {base_url}")
+    log(f"Connecting to Docker Engine via: {base_url}")
 
     try:
         api = DockerAPI(base_url=base_url)

@@ -771,7 +771,7 @@ def reconcile_container(
         return
 
     # --------------------------------------------------
-    # New: global "disable all networks" label
+    # Global "disable all networks" label
     #   label: <prefix>.disablenetwork = true
     #   -> on détache tous les réseaux du conteneur
     # --------------------------------------------------
@@ -1050,6 +1050,31 @@ def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
 
 
 # ---------------------------------------------------------
+# Healthcheck mode
+# ---------------------------------------------------------
+
+
+def healthcheck_main() -> int:
+    """
+    Mode healthcheck:
+      - essaie de se connecter au Docker Engine
+      - fait un appel léger list_containers
+      - retourne 0 si OK, 1 si KO
+    """
+    try:
+        base_url = get_base_url_from_env()
+        api = DockerAPI(base_url=base_url, timeout=3)
+        # Appel minimal : ne récupère que les conteneurs actifs
+        api.list_containers(all_containers=False)
+    except Exception as e:  # noqa: BLE001
+        log(f"[healthcheck] FAIL: {e}")
+        return 1
+
+    # Pas de log en cas de succès pour éviter de spammer les logs toutes les X secondes
+    return 0
+
+
+# ---------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------
 
@@ -1088,4 +1113,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Mode healthcheck : `python watcher.py --healthcheck`
+    if "--healthcheck" in sys.argv[1:]:
+        sys.exit(healthcheck_main())
+
     main()

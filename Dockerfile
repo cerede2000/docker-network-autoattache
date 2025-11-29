@@ -9,10 +9,10 @@ RUN apk add --no-cache git ca-certificates
 WORKDIR /build
 
 # Copy go mod files from src directory
-COPY src/go.mod src/go.sum* ./
+#COPY src/go.mod src/go.sum* ./
 
 # Download dependencies
-RUN go mod download
+#RUN go mod download
 
 # Copy source code from src directory
 COPY src/*.go ./

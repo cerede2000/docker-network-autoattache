@@ -1,28 +1,23 @@
 # syntax=docker/dockerfile:1
 
-# Build stage - Use Go 1.23
+# Build stage
 FROM golang:1.23-alpine AS builder
 
-# Install build dependencies
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /build
 
-# Copy go.mod
-COPY src/go.mod ./
+# Copy EVERYTHING at once - go.mod AND source code
+COPY src/ ./
 
-# Download dependencies
-RUN go mod download
+# Let Go figure out ALL dependencies from the source code
+RUN go get -d ./...
 
-# Copy source code
-COPY src/*.go ./
-
-# Build directly
+# Now build
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v \
     -ldflags='-w -s -extldflags "-static"' \
     -o docker-network-manager .
 
-# Final stage
 FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/

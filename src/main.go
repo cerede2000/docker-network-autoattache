@@ -304,7 +304,6 @@ func (m *NetworkManager) ensureNetworkExists(ctx context.Context, networkName st
 	_, err = m.client.NetworkCreate(ctx, networkName, network.CreateOptions{
 		Driver:   "bridge",
 		Internal: internal,
-		CheckDuplicate: true,
 		Labels: map[string]string{
 			"managed-by": "docker-network-manager",
 		},

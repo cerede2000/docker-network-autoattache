@@ -21,7 +21,7 @@ import (
 
 const (
 	defaultLabelPrefix           = "managed.network."
-	defaultDisconnectDefaultKey  = "disconnectdefault"
+	defaultDisconnectOthersKey   = "disconnectothers"
 	defaultInternalKey           = "internal"
 	defaultReconciliationInterval = 30 * time.Second
 )
@@ -29,7 +29,7 @@ const (
 type NetworkManager struct {
 	client                 *client.Client
 	labelPrefix            string
-	disconnectDefaultKey   string
+	disconnectOthersKey    string
 	internalKey            string
 	reconciliationInterval time.Duration
 	mu                     sync.RWMutex
@@ -47,20 +47,20 @@ func main() {
 	defer cli.Close()
 
 	labelPrefix := getEnv("LABEL_PREFIX", defaultLabelPrefix)
-	disconnectDefaultKey := getEnv("DISCONNECT_DEFAULT_KEY", defaultDisconnectDefaultKey)
+	disconnectOthersKey := getEnv("DISCONNECT_OTHERS_KEY", defaultDisconnectOthersKey)
 	internalKey := getEnv("INTERNAL_KEY", defaultInternalKey)
 	reconciliationInterval := getDurationEnv("RECONCILIATION_INTERVAL", defaultReconciliationInterval)
 
 	log.Printf("Configuration:")
 	log.Printf("  Label prefix: %s", labelPrefix)
-	log.Printf("  Disconnect default label: %s%s", labelPrefix, disconnectDefaultKey)
+	log.Printf("  Disconnect others label: %s%s", labelPrefix, disconnectOthersKey)
 	log.Printf("  Internal network suffix: .%s", internalKey)
 	log.Printf("  Reconciliation interval: %v", reconciliationInterval)
 
 	manager := &NetworkManager{
 		client:                 cli,
 		labelPrefix:            labelPrefix,
-		disconnectDefaultKey:   disconnectDefaultKey,
+		disconnectOthersKey:    disconnectOthersKey,
 		internalKey:            internalKey,
 		reconciliationInterval: reconciliationInterval,
 		managedContainers:      make(map[string]bool),
@@ -246,7 +246,7 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		return nil
 	}
 
-	// Use global network state instead of container-specific requests
+	// Use global network state
 	m.mu.RLock()
 	resolvedNetworks := make(map[string]bool)
 	for netName := range networkLabels {
@@ -265,7 +265,7 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 	m.managedContainers[containerID] = true
 	m.mu.Unlock()
 
-	shouldDisconnectDefault := m.shouldDisconnectDefault(labels)
+	shouldDisconnectOthers := m.shouldDisconnectOthers(labels)
 
 	// Get currently connected networks
 	currentNetworks := make(map[string]bool)
@@ -280,11 +280,10 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 			continue
 		}
 
-		// Check if already connected BEFORE trying to connect
+		// Connect if not already connected
 		if !currentNetworks[netName] {
 			log.Printf("Connecting container %s to network %s", containerID[:12], netName)
 			if err := m.client.NetworkConnect(ctx, netName, containerID, nil); err != nil {
-				// Ignore "already connected" errors
 				if !strings.Contains(err.Error(), "already exists in network") {
 					log.Printf("Error connecting container %s to network %s: %v", 
 						containerID[:12], netName, err)
@@ -292,24 +291,21 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 			}
 		}
 		
+		// Remove from currentNetworks so we know it's managed
 		delete(currentNetworks, netName)
 	}
 
-	// Disconnect from unwanted networks
-	for netName := range currentNetworks {
-		isDefault := m.isDefaultNetwork(netName, containerInfo)
-		
-		if isDefault && !shouldDisconnectDefault {
-			continue
-		}
-
-		log.Printf("Disconnecting container %s from network %s (default: %v)", 
-			containerID[:12], netName, isDefault)
-		if err := m.client.NetworkDisconnect(ctx, netName, containerID, false); err != nil {
-			// Ignore "not connected" errors
-			if !strings.Contains(err.Error(), "is not connected to") {
-				log.Printf("Error disconnecting container %s from network %s: %v", 
-					containerID[:12], netName, err)
+	// Disconnect from OTHER networks if requested
+	// currentNetworks now contains only networks NOT in our managed labels
+	if shouldDisconnectOthers {
+		for netName := range currentNetworks {
+			log.Printf("Disconnecting container %s from unmanaged network %s", 
+				containerID[:12], netName)
+			if err := m.client.NetworkDisconnect(ctx, netName, containerID, false); err != nil {
+				if !strings.Contains(err.Error(), "is not connected to") {
+					log.Printf("Error disconnecting container %s from network %s: %v", 
+						containerID[:12], netName, err)
+				}
 			}
 		}
 	}
@@ -327,7 +323,7 @@ func (m *NetworkManager) extractNetworkLabelsWithInternal(labels map[string]stri
 
 		suffix := strings.TrimPrefix(key, m.labelPrefix)
 		
-		if suffix == m.disconnectDefaultKey {
+		if suffix == m.disconnectOthersKey {
 			continue
 		}
 
@@ -349,23 +345,10 @@ func (m *NetworkManager) extractNetworkLabelsWithInternal(labels map[string]stri
 	return networks
 }
 
-func (m *NetworkManager) shouldDisconnectDefault(labels map[string]string) bool {
-	key := m.labelPrefix + m.disconnectDefaultKey
+func (m *NetworkManager) shouldDisconnectOthers(labels map[string]string) bool {
+	key := m.labelPrefix + m.disconnectOthersKey
 	value, exists := labels[key]
 	return exists && strings.ToLower(value) == "true"
-}
-
-func (m *NetworkManager) isDefaultNetwork(netName string, containerInfo types.ContainerJSON) bool {
-	if netName == "bridge" || netName == "host" || netName == "none" {
-		return true
-	}
-
-	projectName := containerInfo.Config.Labels["com.docker.compose.project"]
-	if projectName != "" && netName == projectName+"_default" {
-		return true
-	}
-
-	return false
 }
 
 func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context, networkName string, shouldBeInternal bool) error {

@@ -23,6 +23,7 @@ const (
 	defaultDisconnectOthersKey   = "disconnectothers"
 	defaultInternalKey           = "internal"
 	defaultReconciliationInterval = 30 * time.Second
+	defaultDisconnectOthersDefault = false // Par défaut : garde les autres réseaux
 )
 
 type NetworkManager struct {
@@ -31,9 +32,10 @@ type NetworkManager struct {
 	disconnectOthersKey    string
 	internalKey            string
 	reconciliationInterval time.Duration
+	disconnectOthersDefault bool // Comportement par défaut si le label n'est pas présent
 	mu                     sync.RWMutex
 	managedContainers      map[string]bool
-	networkInternalState   map[string]bool // Track desired internal state per network
+	networkInternalState   map[string]bool
 }
 
 func main() {
@@ -49,10 +51,12 @@ func main() {
 	disconnectOthersKey := getEnv("DISCONNECT_OTHERS_KEY", defaultDisconnectOthersKey)
 	internalKey := getEnv("INTERNAL_KEY", defaultInternalKey)
 	reconciliationInterval := getDurationEnv("RECONCILIATION_INTERVAL", defaultReconciliationInterval)
+	disconnectOthersDefault := getBoolEnv("DISCONNECT_OTHERS_DEFAULT", defaultDisconnectOthersDefault)
 
 	log.Printf("Configuration:")
 	log.Printf("  Label prefix: %s", labelPrefix)
 	log.Printf("  Disconnect others label: %s%s", labelPrefix, disconnectOthersKey)
+	log.Printf("  Disconnect others default: %v", disconnectOthersDefault)
 	log.Printf("  Internal network suffix: .%s", internalKey)
 	log.Printf("  Reconciliation interval: %v", reconciliationInterval)
 
@@ -62,6 +66,7 @@ func main() {
 		disconnectOthersKey:    disconnectOthersKey,
 		internalKey:            internalKey,
 		reconciliationInterval: reconciliationInterval,
+		disconnectOthersDefault: disconnectOthersDefault,
 		managedContainers:      make(map[string]bool),
 		networkInternalState:   make(map[string]bool),
 	}
@@ -122,7 +127,7 @@ func (m *NetworkManager) reconcileAllContainers(ctx context.Context) error {
 	log.Printf("Found %d containers to check", len(containers))
 
 	// First pass: collect all network requirements
-	networkRequirements := make(map[string]bool) // network -> should be internal
+	networkRequirements := make(map[string]bool)
 	
 	for _, c := range containers {
 		containerInfo, err := m.client.ContainerInspect(ctx, c.ID)
@@ -135,11 +140,10 @@ func (m *NetworkManager) reconcileAllContainers(ctx context.Context) error {
 		
 		for netName, isInternal := range networkLabels {
 			if existing, exists := networkRequirements[netName]; exists {
-				// Conflict detection: if one wants internal and another doesn't
 				if existing != isInternal {
 					log.Printf("⚠️  CONFLICT: Network %s requested as internal=%v and internal=%v - choosing internal=true for security", 
 						netName, existing, isInternal)
-					networkRequirements[netName] = true // Always prefer internal for security
+					networkRequirements[netName] = true
 				}
 			} else {
 				networkRequirements[netName] = isInternal
@@ -210,7 +214,6 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 		
 		log.Printf("Event: %s for container %s", event.Action, event.ID[:12])
 		
-		// For events, trigger a full reconciliation to resolve conflicts
 		if err := m.reconcileAllContainers(ctx); err != nil {
 			log.Printf("Error during event reconciliation: %v", err)
 		}
@@ -279,7 +282,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 			continue
 		}
 
-		// Connect if not already connected
 		if !currentNetworks[netName] {
 			log.Printf("Connecting container %s to network %s", containerID[:12], netName)
 			if err := m.client.NetworkConnect(ctx, netName, containerID, nil); err != nil {
@@ -290,12 +292,10 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 			}
 		}
 		
-		// Remove from currentNetworks so we know it's managed
 		delete(currentNetworks, netName)
 	}
 
 	// Disconnect from OTHER networks if requested
-	// currentNetworks now contains only networks NOT in our managed labels
 	if shouldDisconnectOthers {
 		for netName := range currentNetworks {
 			log.Printf("Disconnecting container %s from unmanaged network %s", 
@@ -347,7 +347,14 @@ func (m *NetworkManager) extractNetworkLabelsWithInternal(labels map[string]stri
 func (m *NetworkManager) shouldDisconnectOthers(labels map[string]string) bool {
 	key := m.labelPrefix + m.disconnectOthersKey
 	value, exists := labels[key]
-	return exists && strings.ToLower(value) == "true"
+	
+	if exists {
+		// Si le label est présent, on utilise sa valeur
+		return strings.ToLower(value) == "true"
+	}
+	
+	// Si le label n'est pas présent, on utilise la valeur par défaut
+	return m.disconnectOthersDefault
 }
 
 func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context, networkName string, shouldBeInternal bool) error {
@@ -489,6 +496,13 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 		if duration, err := time.ParseDuration(value); err == nil {
 			return duration
 		}
+	}
+	return defaultValue
+}
+
+func getBoolEnv(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		return strings.ToLower(value) == "true"
 	}
 	return defaultValue
 }

@@ -369,6 +369,9 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		currentNetworks[netName] = true
 	}
 
+	// Track si des changements de réseaux ont eu lieu
+	networksChanged := false
+
 	// Ensure all labeled networks exist and are connected
 	for netName, isInternal := range resolvedNetworks {
 		if err := m.ensureNetworkExistsWithInternalFlag(ctx, netName, isInternal, runID); err != nil {
@@ -384,6 +387,8 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 					log.Printf("[%s] Error connecting container %s (%s) to network %s: %v",
 						runID, containerName, shortID, netName, err)
 				}
+			} else {
+				networksChanged = true
 			}
 		}
 
@@ -400,7 +405,28 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 					log.Printf("[%s] Error disconnecting container %s (%s) from network %s: %v",
 						runID, containerName, shortID, netName, err)
 				}
+			} else {
+				networksChanged = true
 			}
+		}
+	}
+
+	// Si des réseaux ont changé, forcer un event update pour notifier les autres services (comme Traefik)
+	if networksChanged {
+		log.Printf("[%s] Networks changed for container %s (%s), triggering Docker update event",
+			runID, containerName, shortID)
+
+		// Créer une config d'update minimale (ne change rien, juste trigger un event)
+		updateConfig := container.UpdateConfig{
+			RestartPolicy: containerInfo.HostConfig.RestartPolicy,
+		}
+
+		if _, err := m.client.ContainerUpdate(ctx, containerID, updateConfig); err != nil {
+			log.Printf("[%s] Warning: Failed to trigger update event for %s (%s): %v",
+				runID, containerName, shortID, err)
+		} else {
+			log.Printf("[%s] Successfully triggered update event for container %s (%s)",
+				runID, containerName, shortID)
 		}
 	}
 

@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,7 +28,8 @@ const (
 	defaultReconciliationInterval  = 30 * time.Second
 	defaultDisconnectOthersDefault = false
 	defaultRestartOnNetworkChange  = true
-	defaultRestartTimeout          = 1 // secondes
+	defaultRestartTimeout          = 1
+	defaultHealthCheckPort         = 8080
 )
 
 type NetworkManager struct {
@@ -38,6 +41,9 @@ type NetworkManager struct {
 	disconnectOthersDefault bool
 	restartOnNetworkChange  bool
 	restartTimeout          int
+	healthCheckPort         int
+	lastEventTime           atomic.Int64
+	isHealthy               atomic.Bool
 	mu                      sync.RWMutex
 	managedContainers       map[string]bool
 	networkInternalState    map[string]bool
@@ -60,6 +66,7 @@ func main() {
 	disconnectOthersDefault := getBoolEnv("DISCONNECT_OTHERS_DEFAULT", defaultDisconnectOthersDefault)
 	restartOnNetworkChange := getBoolEnv("RESTART_ON_NETWORK_CHANGE", defaultRestartOnNetworkChange)
 	restartTimeout := getIntEnv("RESTART_TIMEOUT", defaultRestartTimeout)
+	healthCheckPort := getIntEnv("HEALTHCHECK_PORT", defaultHealthCheckPort)
 
 	log.Printf("Configuration:")
 	log.Printf("  Label prefix: %s", labelPrefix)
@@ -69,6 +76,7 @@ func main() {
 	log.Printf("  Reconciliation interval: %v", reconciliationInterval)
 	log.Printf("  Restart on network change: %v", restartOnNetworkChange)
 	log.Printf("  Restart timeout: %ds", restartTimeout)
+	log.Printf("  Healthcheck port: %d", healthCheckPort)
 
 	manager := &NetworkManager{
 		client:                  cli,
@@ -79,9 +87,13 @@ func main() {
 		disconnectOthersDefault: disconnectOthersDefault,
 		restartOnNetworkChange:  restartOnNetworkChange,
 		restartTimeout:          restartTimeout,
+		healthCheckPort:         healthCheckPort,
 		managedContainers:       make(map[string]bool),
 		networkInternalState:    make(map[string]bool),
 	}
+
+	manager.isHealthy.Store(true)
+	manager.lastEventTime.Store(time.Now().Unix())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -92,13 +104,17 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Received shutdown signal, stopping...")
+		manager.isHealthy.Store(false)
 		cancel()
 	}()
+
+	go manager.startHealthCheckServer()
 
 	log.Println("Performing initial reconciliation...")
 	runID := generateRunID()
 	if err := manager.reconcileAllContainers(ctx, runID); err != nil {
 		log.Printf("[%s] Warning: Initial reconciliation failed: %v", runID, err)
+		manager.isHealthy.Store(false)
 	}
 
 	go manager.periodicReconciliation(ctx)
@@ -109,6 +125,68 @@ func main() {
 	}
 
 	log.Println("Docker Network Manager stopped")
+}
+
+func (m *NetworkManager) startHealthCheckServer() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if !m.isHealthy.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, `{"status":"unhealthy","message":"Service is not running properly"}`)
+			return
+		}
+
+		lastEvent := m.lastEventTime.Load()
+		timeSinceLastEvent := time.Since(time.Unix(lastEvent, 0))
+
+		if lastEvent > 0 && timeSinceLastEvent > 5*time.Minute {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, `{"status":"unhealthy","message":"No events received for %v"}`, timeSinceLastEvent)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		_, err := m.client.Ping(ctx)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, `{"status":"unhealthy","message":"Docker connection failed: %v"}`, err)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"healthy","last_event":"%v"}`, time.Unix(lastEvent, 0).Format(time.RFC3339))
+	})
+
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		if m.isHealthy.Load() {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"status":"ready"}`)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, `{"status":"not ready"}`)
+		}
+	})
+
+	mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"alive"}`)
+	})
+
+	addr := fmt.Sprintf(":%d", m.healthCheckPort)
+	log.Printf("Starting healthcheck server on %s", addr)
+
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("Healthcheck server error: %v", err)
+		m.isHealthy.Store(false)
+	}
 }
 
 func (m *NetworkManager) periodicReconciliation(ctx context.Context) {
@@ -133,7 +211,6 @@ func (m *NetworkManager) periodicReconciliation(ctx context.Context) {
 }
 
 func (m *NetworkManager) reconcileAllContainers(ctx context.Context, runID string) error {
-	// Empêcher les réconciliations simultanées
 	m.reconciliationMutex.Lock()
 	defer m.reconciliationMutex.Unlock()
 
@@ -144,7 +221,6 @@ func (m *NetworkManager) reconcileAllContainers(ctx context.Context, runID strin
 
 	log.Printf("[%s] Found %d containers to check", runID, len(containers))
 
-	// First pass: collect all network requirements
 	networkRequirements := make(map[string]bool)
 
 	for _, c := range containers {
@@ -169,12 +245,10 @@ func (m *NetworkManager) reconcileAllContainers(ctx context.Context, runID strin
 		}
 	}
 
-	// Update network internal state cache
 	m.mu.Lock()
 	m.networkInternalState = networkRequirements
 	m.mu.Unlock()
 
-	// Second pass: reconcile containers with resolved network states
 	managedCount := 0
 	skippedCount := 0
 	errorCount := 0
@@ -228,9 +302,10 @@ func (m *NetworkManager) watchEvents(ctx context.Context) error {
 func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) {
 	runID := generateRunID()
 
+	m.lastEventTime.Store(time.Now().Unix())
+
 	switch event.Action {
 	case "start", "update":
-		// Délai court pour laisser le container s'initialiser
 		time.Sleep(150 * time.Millisecond)
 
 		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
@@ -262,7 +337,6 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 }
 
 func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Context, containerID string, runID string) error {
-	// Acquérir le mutex pour éviter les conflits avec la loop périodique
 	m.reconciliationMutex.Lock()
 	defer m.reconciliationMutex.Unlock()
 
@@ -288,7 +362,6 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 		return nil
 	}
 
-	// Vérifier s'il y a des conflits avec les réseaux existants
 	hasConflict := false
 	m.mu.RLock()
 	for netName, wantInternal := range networkLabels {
@@ -302,7 +375,6 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 	}
 	m.mu.RUnlock()
 
-	// Si conflit détecté, faire une réconciliation complète
 	if hasConflict {
 		log.Printf("[%s] Conflict detected for container %s (%s), triggering full reconciliation...",
 			runID, containerName, shortID)
@@ -313,7 +385,6 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 		return err
 	}
 
-	// Pas de conflit : mettre à jour le cache et réconcilier ce container uniquement
 	m.mu.Lock()
 	for netName, isInternal := range networkLabels {
 		m.networkInternalState[netName] = isInternal
@@ -346,7 +417,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		return nil
 	}
 
-	// Use global network state
 	m.mu.RLock()
 	resolvedNetworks := make(map[string]bool)
 	for netName := range networkLabels {
@@ -367,16 +437,13 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 
 	shouldDisconnectOthers := m.shouldDisconnectOthers(labels)
 
-	// Get currently connected networks
 	currentNetworks := make(map[string]bool)
 	for netName := range containerInfo.NetworkSettings.Networks {
 		currentNetworks[netName] = true
 	}
 
-	// Track si des changements de réseaux ont eu lieu
 	networksChanged := false
 
-	// Ensure all labeled networks exist and are connected
 	for netName, isInternal := range resolvedNetworks {
 		if err := m.ensureNetworkExistsWithInternalFlag(ctx, netName, isInternal, runID); err != nil {
 			log.Printf("[%s] Error ensuring network %s exists: %v", runID, netName, err)
@@ -399,7 +466,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		delete(currentNetworks, netName)
 	}
 
-	// Disconnect from OTHER networks if requested
 	if shouldDisconnectOthers {
 		for netName := range currentNetworks {
 			log.Printf("[%s] Disconnecting container %s (%s) from unmanaged network %s",
@@ -415,15 +481,13 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		}
 	}
 
-	// Si des réseaux ont changé ET que le container a traefik.enable=true, restart pour forcer Traefik à rescanner
 	if networksChanged {
 		traefikEnabled := strings.ToLower(labels["traefik.enable"]) == "true"
-		
+
 		if traefikEnabled && m.restartOnNetworkChange {
 			log.Printf("[%s] Networks changed for container %s (%s) with Traefik enabled, performing quick restart",
 				runID, containerName, shortID)
-			
-			// Restart rapide avec timeout court
+
 			timeout := m.restartTimeout
 			if err := m.client.ContainerRestart(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
 				log.Printf("[%s] Warning: Failed to restart container %s (%s): %v",

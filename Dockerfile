@@ -21,7 +21,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v \
 # Runtime stage - using alpine instead of scratch for curl
 FROM alpine:latest
 
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# Install curl for healthcheck
+RUN apk --no-cache add curl ca-certificates
+
 COPY --from=builder /build/docker-network-manager /docker-network-manager
 
 # Healthcheck
